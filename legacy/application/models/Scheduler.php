@@ -196,11 +196,34 @@ final class Application_Model_Scheduler
     {
         foreach ($mediaItems as $mediaItem) {
             $id = $mediaItem['id'];
-            if ($mediaItem['type'] === 'playlist') {
-                $playlist = new Application_Model_Playlist($id, $this->con);
-                if ($playlist->containsMissingFiles()) {
-                    throw new Exception(_('Cannot schedule a playlist that contains missing files.'));
+            if ($item['type'] == 'playlist') {
+    $playlist = new Application_Model_Playlist($item['id']);
+    $playlistContent = $playlist->getContents();
+
+    foreach ($playlistContent as $playlistItem) {
+        if ($playlistItem['type'] == 2 /* Smart Block */) {
+            $block = new Application_Model_Block($playlistItem['id']);
+            
+            if ($block->isDynamic()) {
+                // É um smart block dinâmico, precisamos resolver com nosso filtro novo
+                $faixasSelecionadas = $this->getTracksFromDynamicBlockAvoidingRepetition($block, $musicasJaEscaladas);
+
+                foreach ($faixasSelecionadas as $trackFileId) {
+                    // Agendar o track normalmente
+                    $this->scheduleTrack($trackFileId, $showInstanceId, $startTime);
+                    
+                    // Marcar como escalada para evitar repetir
+                    $musicasJaEscaladas[] = $trackFileId;
+                    
+                    // Atualizar $startTime para a próxima faixa (não esquecer isso!)
+                    $startTime += $this->getTrackDuration($trackFileId);
                 }
+                continue; // já tratamos esse bloco
+            }
+        }
+    }
+}
+
             }
         }
 
@@ -214,6 +237,45 @@ final class Application_Model_Scheduler
      *
      * @return $files
      */
+    private function getTracksFromDynamicBlockAvoidingRepetition($block, $musicasJaEscaladas)
+{
+    $query = CcFilesQuery::create()
+        ->filterByDisabled(false);
+
+    // Pegar critérios do smart block (ex: gênero, duração, etc.)
+    $criteria = $block->getCriteria();
+    foreach ($criteria as $crit) {
+        // Aplicar critérios normalmente aqui (a gente detalha isso depois se precisar)
+    }
+
+    // Filtro: não tocadas nas últimas 6 horas (usando lptime)
+    $sixHoursAgo = date('Y-m-d H:i:s', strtotime('-6 hours'));
+    $query->where('(cc_files.lptime IS NULL OR cc_files.lptime < ?)', $sixHoursAgo);
+
+    // Filtro: não já escaladas neste show
+    if (!empty($musicasJaEscaladas)) {
+        $query->filterById($musicasJaEscaladas, Criteria::NOT_IN);
+    }
+
+    // Selecionar faixas aleatórias
+    $query->orderBy('RAND()');
+
+    // Limitar por quantidade definida no smart block
+    $limit = $block->getTrackLimit();
+    if ($limit > 0) {
+        $query->limit($limit);
+    }
+
+    $faixas = $query->find();
+
+    $ids = [];
+    foreach ($faixas as $faixa) {
+        $ids[] = $faixa->getId();
+    }
+
+    return $ids;
+}
+
     private function retrieveMediaFiles($id, $type, $show)
     {
         // if there is a show we need to set a show limit to pass to smart blocks in case they use time remaining
@@ -1103,6 +1165,7 @@ final class Application_Model_Scheduler
     public function scheduleAfter($scheduleItems, $mediaItems, $adjustSched = true)
     {
         $this->con->beginTransaction();
+        $musicasJaEscaladas = [];
 
         try {
             // Increase the transaction isolation level to prevent two concurrent requests from potentially resulting
